@@ -1,1 +1,1 @@
-# Wasserstein-Distributional-Learning
+# Wasserstein Distributional Learning
