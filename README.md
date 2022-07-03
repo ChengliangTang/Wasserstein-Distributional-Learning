@@ -40,6 +40,8 @@ The first comparison method Frechet regression is implemented using the R packag
 
 The second comparison method CLR regression is implemented by adapting the R codes from the reference paper **Talská, R., Menafoglio, A., Machalová, J., Hron, K., & Fišerová, E. (2018). Compositional regression with functional response. Computational Statistics & Data Analysis, 123, 66-85**.
 
+The third comparison method MDN is implemented in Python 3 with Tensorflow. All the function definitions are contained in Python notebooks.
+
 # Instructions for Use
 
 ## Reproducibility
