@@ -94,9 +94,9 @@ density2cdf <- function(z, x, y){
 
 ```{r}
 # load data
-X <- as.matrix(read.csv('../../../../data/simulation/setting_1/dat_X.csv'))
-Y <- as.matrix(read.csv('../../../../data/simulation/setting_1/dat_Y.csv'))
-loc_CV <- unlist(read.csv('../../../../data/simulation/setting_1/dat_CV.csv'))
+X <- as.matrix(read.csv('../../../../data/simulation/setting_4/dat_X.csv'))
+Y <- as.matrix(read.csv('../../../../data/simulation/setting_4/dat_Y.csv'))
+loc_CV <- unlist(read.csv('../../../../data/simulation/setting_4/dat_CV.csv'))
 loc_CV <- loc_CV + 1
 ```
 

@@ -1,0 +1,182 @@
+---
+title: "Climate_Frechet"
+output: html_document
+---
+
+
+```{r}
+# import libraries
+library(frechet)
+library(dplyr)
+library(ggplot2)
+library(parallel)
+library(cowplot)
+```
+
+```{r}
+### FUNCTION DEFINITIONS
+qt2cdf <- function(q_levs, x, y){
+  cdf <- approx(x, q_levs, xout = y)
+  cdf_vec <- cdf$y
+  cdf_vec[y < min(x)] <- 0
+  cdf_vec[y > max(x)] <- 1
+  return(cdf_vec)
+}
+
+qt2pdf <- function(q_levs, x, y){
+  n_y <- length(y)
+  cdf <- qt2cdf(q_levs, x, y)
+  cdf_vec <- c(2*cdf[1] - cdf[2], cdf, 2*cdf[n_y] - cdf[n_y - 1])
+  loc_vec <- c(2*y[1] - y[2], y, 2*y[n_y] - y[n_y - 1])
+  cdf_c <- c(cdf_vec[3:(n_y + 2)], 0, 0) - cdf_vec
+  loc_c <- c(loc_vec[3:(n_y + 2)], 0, 0) - loc_vec
+  pdf_vec <- cdf_c / loc_c
+  return(pdf_vec[1:n_y])
+}
+
+
+```
+
+```{r}
+# load data
+X <- as.matrix(read.csv('../../data/processed/dat_X.csv'))
+X <- X[21:153,]
+Y <- as.matrix(read.csv('../../data/processed/dat_Y.csv'))
+loc_CV <- unlist(read.csv('../../data/processed/dat_CV.csv'))
+loc_CV <- loc_CV + 1
+```
+
+
+```{r}
+# cross validation
+## split the data
+n_fold <- max(loc_CV)
+n_levs <- 100
+q_sup <- c(0:n_levs) / n_levs
+time_start <- Sys.time()
+train_loss <- rep(0, n_fold)
+val_loss <- rep(0, n_fold)
+Y_pred_train <- matrix(0, nrow = dim(Y)[1], (n_levs+1))
+Y_pred_val <- matrix(0, nrow = dim(Y)[1], (n_levs+1))
+for (id_fold in 1:n_fold){
+  print(paste0('This is fold ', id_fold, '.'))
+  X_train <- X[loc_CV != id_fold, ]
+  Y_train <- Y[loc_CV != id_fold, ]
+  X_val <- X[loc_CV == id_fold, ]
+  Y_val <- Y[loc_CV == id_fold, ]
+  res_train <- GloDenReg(xin=X_train, yin=Y_train, xout=X_train, optns = list(qSup = q_sup))
+  res_val <- GloDenReg(xin=X_train, yin=Y_train, xout=X_val, optns = list(qSup = q_sup))
+  q_out_train <-t(apply(Y_train, 1, function(x) {quantile(x, q_sup)}))
+  q_out_val <- t(apply(Y_val, 1, function(x) {quantile(x, q_sup)}))
+  Y_pred_train[loc_CV != id_fold, ] <- res_train$qout
+  Y_pred_val[loc_CV == id_fold, ] <- res_val$qout
+  train_loss[id_fold] <- mean((q_out_train[, 2:n_levs] - res_train$qout[, 2:n_levs])^2)
+  val_loss[id_fold] <- mean((q_out_val[, 2:n_levs] - res_val$qout[, 2:n_levs])^2)
+}
+print(Sys.time() - time_start)
+```
+
+```{r, fig.width=7, fig.height=2}
+# visualize the histogram and predicted density
+y_start <- quantile(Y, 0.0005)
+y_end <- quantile(Y, 0.9995)
+## choose the number of bins using Sturges rule
+n_bins <- 5 * as.integer(1 + log2(dim(Y)[1] * dim(Y)[2]))
+## calculate the CLR of Y
+loc_fine = seq(y_start, y_end, length.out = 50) # locations for evaluation and visualization
+pdf_train <- apply(Y_pred_train, 1, function(x) return(qt2pdf(q_sup, x, loc_fine)))
+pdf_val <- apply(Y_pred_val, 1, function(x) return(qt2pdf(q_sup, x, loc_fine)))
+plots_ <- list()
+for (i in 1:10){
+  idd <- i * 5
+  df_dens_val <- data.frame(x=loc_fine, y=pdf_val[ , idd])
+  df_dens_train <- data.frame(x=loc_fine, y=pdf_train[ , idd])
+  df_hist <- data.frame(x=Y[idd, ])
+  plots_[[i]] <- ggplot(data = df_hist, aes(x=x, ..density..)) +
+  geom_histogram(bins = 30, fill="lightblue", color='blue') +
+  geom_line(data = df_dens_train, aes(x=x,y=y),  color='red') + 
+  geom_line(data = df_dens_val, aes(x=x,y=y),  color='orange') + 
+  theme(legend.position = "none") + theme_bw()
+}
+
+plot_grid(plots_[[1]], plots_[[2]], plots_[[3]], plots_[[4]], plots_[[5]],
+          plots_[[6]], plots_[[7]], plots_[[8]], plots_[[9]], plots_[[10]],
+          ncol = 5, rel_widths = c(1, 1, 1, 1, 1))
+```
+
+
+
+```{r}
+# calculate R-squared
+val_loss <- mean(val_loss)
+train_loss <- mean(train_loss)
+q_Y <- t(apply(Y, 1, function(x) {quantile(x, q_sup)}))
+mat_res <- t(apply(q_Y, 1, function(x) x - colMeans(q_Y)))
+var_Y <- mean(mat_res[, 2:n_levs]^2)
+r_square_train <- 1 - train_loss / var_Y
+r_square_val <- 1 - val_loss / var_Y
+print(paste0('Output variance: ', var_Y))
+print(paste0('Train loss: ', train_loss))
+print(paste0('Train R-squared: ',r_square_train))
+print(paste0('Test loss: ', val_loss))
+print(paste0('Test R-squared: ',r_square_val))
+write.csv(Y_pred_val, file='../../output/predictions/pred_Frechet.csv')
+```
+
+```{r}
+# partial dependence plots
+library(snow)
+## specify the quantile levels
+p_levs <- c(0.1, 0.3, 0.5, 0.7, 0.9)
+## quantiles of the data
+mat_qt_d <- apply(Y, 1, function(x) {quantile(x, p_levs)})
+## Frechet regression
+q_levs <- seq(0, 1, 0.05)
+mat_qt_X <- apply(X, 2, function(x) {quantile(x, q_levs)})
+time_start <- Sys.time()
+print(time_start)
+cl <- makeCluster(4, type="SOCK")
+clusterExport(cl, "X")
+clusterExport(cl, "Y")
+clusterExport(cl, "GloDenReg")
+clusterExport(cl, "q_sup")
+res_list <- vector(mode = "list", length = 3)
+for (i in 1:4){
+  print(i)
+  fun_t <- function(x){
+    X_c <- X
+    X_c[, i] <- x
+    res <- GloDenReg(xin=X, yin=Y, xout=X_c, optns = list(qSup = q_sup))
+    return(res)
+  }
+  clusterExport(cl, "i")
+  res_list[[i]] <- clusterApply(cl, mat_qt_X[, i], fun_t)
+}
+stopCluster(cl)
+print(Sys.time() - time_start)
+```
+
+
+```{r}
+# save the results as rdata
+p_levs <- c(0.1, 0.3, 0.5, 0.7, 0.9)
+y_levs <- quantile(Y, p_levs)
+qt_array <- matrix(0, nrow = 4*length(q_levs), ncol = length(p_levs))
+cdf_array <- matrix(0, nrow = 4*length(q_levs), ncol = length(p_levs))
+pdf_array <- matrix(0, nrow = 4*length(q_levs), ncol = length(p_levs))
+for (i in 1:4){
+  for (j in 1:length(q_levs)){
+    id_row <- (i - 1) * length(q_levs) + j
+    qt_normalize <- apply(res_list[[i]][[j]]$qout, 1, function(x) return(approx(q_sup, x, xout = p_levs)$y))
+    qt_array[id_row, ] <- rowMeans(qt_normalize)
+    cdf_normalize <- apply(res_list[[i]][[j]]$qout, 1, function(x) return(qt2cdf(q_sup, x, y_levs)))
+    cdf_array[id_row, ] <- rowMeans(cdf_normalize)
+    pdf_normalize <- apply(res_list[[i]][[j]]$qout, 1, function(x) return(qt2pdf(q_sup, x, y_levs)))
+    pdf_array[id_row, ] <- rowMeans(pdf_normalize)
+  }
+}
+write.csv(qt_array, file = '../../output/predictions/res_Frechet_qt.csv')
+#write.csv(cdf_array, file = '../output/res_Frechet_cdf.csv')
+#write.csv(pdf_array, file = '../output/res_Frechet_pdf.csv')
+```
+

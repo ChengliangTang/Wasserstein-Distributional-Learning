@@ -1,0 +1,252 @@
+---
+title: "climate_nestedCV_CLR"
+output: html_document
+---
+
+```{r}
+# import libraries
+library(fda)
+library(quadprog)
+library(ggplot2)
+library(cowplot)
+library(gridExtra)
+```
+
+```{r}
+### FUNCTION DEFINITIONS
+
+# Inverse of CLR transformation 
+## Input: z = grid of point defining the abscissa 
+##        z_step = step of the grid of the abscissa
+##        clr = grid evaluation of the clr transformed density
+## Output: grid evaluation of the density
+clr2density <- function(z, z_step, clr){
+  if (is.fd(clr))
+    return(exp(eval.fd(z, clr)) / trapzc(z_step, exp(eval.fd(z, clr))))
+  else
+    return(exp(clr) / trapzc(z_step, exp(clr)))
+}
+
+# Numerical integration via trapezoidal formula
+## Input: y = grid evaluation of the function
+##        z_step = step of the grid
+## Output: numerical integration over the interval
+trapzc <- function(step, y){
+  n_pts <- length(y)
+  res_int <- step * (0.5*y[1] + sum(y[2:(n_pts-1)]) + 0.5*y[n_pts])
+  return(res_int)
+}
+
+# B-spline fitting of CLR
+clr2coef <- function(z, clr, n_knot, y_start, y_end, d = 2){
+  norder <- d + 1                 # order of splines (degree + 1)
+  nbasis <- n_knot + norder - 2    # g+k+1 (dimension)
+
+  # Create bspline basis
+  knots <- seq(y_start, y_end, length=n_knot) # knots
+  splajn.basis <- create.bspline.basis(range(knots), nbasis, norder, breaks = knots)
+
+  knot_vec <- c(rep(z[1], d), z, rep(z[n_knot], d))
+  knot_diff <- rep(0, nbasis)
+  for (i in 1:nbasis){
+    knot_diff[i] <- knot_vec[i + norder] - knot_vec[i]
+  }
+
+  # Create matrix
+  A <- eval.basis(z, splajn.basis)
+  b <- clr
+  Dmat <- t(A) %*% A
+  dvec <- t(b) %*% A
+  bvec <- c(0)
+  Amat <- matrix(c(knot_diff), nbasis, 1)
+  x_sol <- solve.QP(Dmat, dvec, Amat, bvec=bvec, meq = 1)
+  return(x_sol$solution)
+}
+
+# B-spline coef to density 
+coef2density <- function(z, bspline.basis, x){
+  beta.fd <- fd(x, bspline.basis)
+  beta.l <- eval.fd(z, beta.fd)
+  res <- clr2density(z, z[2]-z[1], beta.l)
+  return(res)
+}
+
+# density to quantile
+density2quantile <- function(z, x, q_levs){
+  ## Input: z = equally-spaced grid of point defining the abscissa
+  z_step <- z[2] - z[1]
+  cdf <- cumsum(x) * z_step
+  res <- approx(cdf, z, xout = q_levs)
+  return(res$y)
+}
+
+# density to cdf
+density2cdf <- function(z, x, y){
+  ## Input: z = equally-spaced grid of point defining the abscissa
+  ##        x = density values
+  ##        y = grid of output points
+  z_step <- z[2] - z[1]
+  cdf <- cumsum(x) * z_step
+  res <- approx(z, cdf, xout = y)
+  return(res$y)
+}
+```
+
+```{r}
+# load data
+X <- as.matrix(read.csv('../../data/processed/dat_X.csv'))
+X <- X[21:153,]
+Y <- as.matrix(read.csv('../../data/processed/dat_Y.csv'))
+loc_CV <- unlist(read.csv('../../data/processed/dat_CV.csv'))
+loc_CV <- loc_CV + 1
+```
+
+```{r}
+# Optional: apply Linear Regression to remove the conditional expectation ==> functional regression for residual
+Y_mean <- rowMeans(Y)
+model_linear <- lm(Y_mean~X)
+Y_res <- Y #- predict(model_linear, data.frame(X))
+```
+
+```{r}
+# create count matrix
+## choose the start points
+eps <- 1e-3
+y_range <- max(Y_res) - min(Y_res)
+y_start <- min(Y_res) - eps
+y_end <- max(Y_res) + eps
+print(c(y_start, y_end))
+## choose the number of bins using Sturges rule
+n_bins <- as.integer(1 + log2(dim(Y)[1] * dim(Y)[2]))
+step_size <- (y_end - y_start) / n_bins
+## calculate the CLR of Y
+loc_breaks <- seq(y_start, y_end, length.out = n_bins + 1)
+Y_count <- apply(Y_res, 1, function(x) return(hist(x, breaks = loc_breaks, plot = FALSE)$counts))
+```
+
+```{r}
+# apply CLR transformation to count matrix
+## process the zero counts
+s <- 1 ## Perks prior
+mat_alpha <- rowSums(Y_count) - Y_count
+mat_t <- mat_alpha / colSums(mat_alpha)
+mat_x <- Y_count / colSums(Y_count)
+mat_r <- matrix(0, nrow = nrow(Y_count), ncol = ncol(Y_count))
+Y_comp <- matrix(0, nrow = nrow(Y_count), ncol = ncol(Y_count))
+for (i in 1:ncol(Y_count)){
+  for (j in 1:nrow(Y_count)){
+    if (mat_x[j, i] == 0){
+      mat_r[j, i] <- mat_t[j, i] * s / (s + n_bins)
+    }
+  }
+}
+for (i in 1:ncol(Y_count)){
+  for (j in 1:nrow(Y_count)){
+    if (mat_x[j, i] > 0){
+      Y_comp[j, i] <- mat_x[j, i] * (1 - sum(mat_r[, i]))
+    }
+    else{
+      Y_comp[j, i] <- mat_r[j, i]
+    }
+  }
+}
+Y_dens <- Y_comp / step_size
+Y_clr <- apply(Y_dens, 2, function(x) return(log(x) - mean(log(x))))
+```
+
+```{r}
+## calculate the B-spline coefficient of Y_clr
+y_start <- min(Y_res) - eps + step_size / 2
+y_end <- max(Y_res) + eps - step_size / 2
+z <- seq(y_start, y_end, length.out = n_bins)
+loc_fine = seq(y_start, y_end, length.out = 256)
+```
+
+```{r}
+## nested Cross Validation
+## split the data
+n_fold <- max(loc_CV)
+## evaluation levels
+n_levs <- 100
+q_sup <- c(1:(n_levs-1)) / n_levs
+q_true <-t(apply(Y_res, 1, function(x) {quantile(x, q_sup)}))
+q_pred <- matrix(0, nrow = nrow(q_true), ncol = ncol(q_true))
+## parameter sets
+norder_list <- c(2, 3, 4)
+nknot_list <- c(5, 8, 10)
+loss_nest <- rep(0, n_fold)
+for (id_test in 1:n_fold){
+  print(paste0('This is fold ', id_test, '.'))
+  ## select the test data
+  X_test <- X[loc_CV == id_test, ]
+  Y_test <- Y[loc_CV == id_test, ]
+  ## loop over the parameter combinations
+  loss_val <- matrix(0, nrow=9, ncol=3)
+  for (i in 1:3){
+    norder <- norder_list[i]
+    for (j in 1:3){
+      n_knot <- nknot_list[j]
+      nbasis <- n_knot + norder - 2 
+      knots <- seq(y_start, y_end, length=n_knot) # knots 
+      loss_val[3*i + j - 3, 1] <- norder
+      loss_val[3*i + j - 3, 2] <- n_knot
+      for (id_val in setdiff(1:n_fold, id_test)){
+        X_val <- X[loc_CV == id_val, ]
+        Y_val <- Y[loc_CV == id_val, ]
+        X_train <- X[(loc_CV != id_val)*(loc_CV != id_test) == 1, ]
+        Y_train <- Y[(loc_CV != id_val)*(loc_CV != id_test) == 1, ]
+        
+        clr_coef_train <- Y_clr[, (loc_CV != id_val)*(loc_CV != id_test) == 1]
+        Y_coef_train <- apply(clr_coef_train, 2, function(x) return(clr2coef(z, x, n_knot, y_start, y_end, d=norder-1)))
+        splajn.basis <- create.bspline.basis(c(y_start, y_end), nbasis, norder, breaks = knots)
+        
+        X_train_full <- as.matrix(cbind(rep(1, dim(X_train)[1]), X_train))
+        X_val_full <- as.matrix(cbind(rep(1, dim(X_val)[1]), X_val))
+        B = solve(t(X_train_full)%*%X_train_full)%*%t(X_train_full)%*%as.matrix(t(Y_coef_train))
+        pred_val <- X_val_full %*% B
+        dens_val <- t(apply(pred_val, 1, function(x) return(coef2density(loc_fine, splajn.basis, x))))
+        quantile_val <- t(apply(dens_val, 1, function(x) return(density2quantile(loc_fine, x, q_levs = q_sup))))
+        q_val <-t(apply(Y_val, 1, function(x) {quantile(x, q_sup)}))
+        val_loss <- mean((quantile_val - q_val)^2)
+        loss_val[3*i + j - 3, 3] <- loss_val[3*i + j - 3, 3] + val_loss
+      }
+    }
+  }
+  loc_best <- which.min(loss_val[, 3])
+  #print(loss_val[, 3])
+  norder_best <- norder_list[ceiling(loc_best / 3)]
+  nknot_best <- nknot_list[(loc_best - 1) %% 3 + 1]
+  nbasis_best <- nknot_best + norder_best - 2 
+  print(c(nknot_best, norder_best))
+  knots_best <- seq(y_start, y_end, length=nknot_best) # knots 
+  
+  X_train <- X[loc_CV != id_test, ]
+  Y_train <- Y[loc_CV != id_test, ]
+  clr_coef_train <- Y_clr[, loc_CV != id_test]
+  Y_coef_train <- apply(clr_coef_train, 2, function(x) return(clr2coef(z, x, nknot_best, y_start, y_end, d=norder_best-1)))
+  splajn.basis <- create.bspline.basis(c(y_start, y_end), nbasis_best, norder_best, breaks = knots_best)
+  
+  X_train_full <- as.matrix(cbind(rep(1, dim(X_train)[1]), X_train))
+  X_test_full <- as.matrix(cbind(rep(1, dim(X_test)[1]), X_test))
+  B = solve(t(X_train_full)%*%X_train_full)%*%t(X_train_full)%*%as.matrix(t(Y_coef_train))
+  pred_test <- X_test_full %*% B
+  dens_test <- t(apply(pred_test, 1, function(x) return(coef2density(loc_fine, splajn.basis, x))))
+  quantile_test <- t(apply(dens_test, 1, function(x) return(density2quantile(loc_fine, x, q_levs = q_sup))))
+  q_test <-t(apply(Y_test, 1, function(x) {quantile(x, q_sup)}))
+  test_loss <- mean((quantile_test - q_test)^2)
+  loss_nest[id_test] <- test_loss
+  q_pred[loc_CV == id_test, ] <- quantile_test
+  print(c(id_test, test_loss))
+}
+```
+
+```{r}
+loss_cv <- mean((q_pred - q_true)^2)
+mat_res <- t(apply(q_true, 1, function(x) x - colMeans(q_true)))
+var_Y <- mean(mat_res^2)
+print(paste0('Test loss: ', loss_cv))
+print(paste0('Test R-squared: ', 1 - loss_cv / var_Y))
+write.csv(q_pred, file='../../output/predictions/pred_CLR.csv')
+```
+
+

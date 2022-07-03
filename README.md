@@ -44,5 +44,5 @@ The second comparison method CLR regression is implemented by adapting the R cod
 
 ## Reproducibility
 1. The subfolder named **codes/simulation** contains the codes to reproduce all the results in simulations, including Table 1 and Figure 2&3.
-2. The subfolder named **codes/climate** contains the codes to reproduce all the results in climate modeling, including Figure 1, Figure 4&5, and Figure D in the Appendix.
-3. The subfolder named **codes/income** contains the codes to reproduce all the results in income modeling, including Table 2 and Figure 6&7.
+2. The subfolder named **codes/climate** contains the codes to reproduce all the results in climate modeling, including Figure 1, Figure 4&5&6, and Figure D in the Appendix.
+3. The subfolder named **codes/income** contains the codes to reproduce all the results in income modeling, including Table 2 and Figure 7&8.

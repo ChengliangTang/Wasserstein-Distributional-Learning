@@ -1,0 +1,360 @@
+---
+title: "climate_CLR_PDP"
+output: html_document
+---
+
+```{r}
+# import libraries
+library(fda)
+library(quadprog)
+library(ggplot2)
+library(cowplot)
+library(gridExtra)
+library(reticulate)
+```
+
+```{r}
+### FUNCTION DEFINITIONS
+# CLR transformation
+## Input: z = grid of point defining the abscissa 
+##        d_dens = grid evaluation of the density
+## Output: grid evaluation of the clr transformed density
+# density2clr <- function(z, d_dens){
+#   if (is.fd(d_dens))
+#     return(log(eval.fd(z, d_dens)) - mean(log(eval.fd(z, d_dens))))
+#   else
+#     return(log(d_dens) - mean(log(d_dens)))
+# }
+
+# Inverse of CLR transformation 
+## Input: z = grid of point defining the abscissa 
+##        z_step = step of the grid of the abscissa
+##        clr = grid evaluation of the clr transformed density
+## Output: grid evaluation of the density
+clr2density <- function(z, z_step, clr){
+  if (is.fd(clr))
+    return(exp(eval.fd(z, clr)) / trapzc(z_step, exp(eval.fd(z, clr))))
+  else
+    return(exp(clr) / trapzc(z_step, exp(clr)))
+}
+
+# Numerical integration via trapezoidal formula
+## Input: y = grid evaluation of the function
+##        z_step = step of the grid
+## Output: numerical integration over the interval
+trapzc <- function(step, y){
+  n_pts <- length(y)
+  res_int <- step * (0.5*y[1] + sum(y[2:(n_pts-1)]) + 0.5*y[n_pts])
+  return(res_int)
+}
+
+# CLR transformation with KDE estimation
+# pts2clr <- function(y, n_locs, y_start, y_end, eps=1e-10){
+#   d <- density(y, n = n_locs, from = y_start, to = y_end)
+#   d_dens <- d$y + eps
+#   z <- d$x
+#   res <- density2clr(z, d_dens)
+#   return(res)
+# }
+
+# B-spline fitting of CLR
+clr2coef <- function(z, clr, n_knot, y_start, y_end, d = 2){
+  norder <- d + 1                 # order of splines (degree + 1)
+  nbasis <- n_knot + norder - 2    # g+k+1 (dimension)
+
+  # Create bspline basis
+  knots <- seq(y_start, y_end, length=n_knot) # knots
+  splajn.basis <- create.bspline.basis(range(knots), nbasis, norder, breaks = knots)
+
+  knot_vec <- c(rep(z[1], d), z, rep(z[n_knot], d))
+  knot_diff <- rep(0, nbasis)
+  for (i in 1:nbasis){
+    knot_diff[i] <- knot_vec[i + norder] - knot_vec[i]
+  }
+
+  # Create matrix
+  A <- eval.basis(z, splajn.basis)
+  b <- clr
+  Dmat <- t(A) %*% A
+  dvec <- t(b) %*% A
+  bvec <- c(0)
+  Amat <- matrix(c(knot_diff), nbasis, 1)
+  x_sol <- solve.QP(Dmat, dvec, Amat, bvec=bvec, meq = 1)
+  return(x_sol$solution)
+}
+
+# B-spline coef to density 
+coef2density <- function(z, bspline.basis, x){
+  beta.fd <- fd(x, bspline.basis)
+  beta.l <- eval.fd(z, beta.fd)
+  res <- clr2density(z, z[2]-z[1], beta.l)
+  return(res)
+}
+
+# density to quantile
+density2quantile <- function(z, x, q_levs){
+  ## Input: z = equally-spaced grid of point defining the abscissa
+  z_step <- z[2] - z[1]
+  cdf <- cumsum(x) * z_step
+  res <- approx(cdf, z, xout = q_levs)
+  return(res$y)
+}
+
+# density to cdf
+density2cdf <- function(z, x, y){
+  ## Input: z = equally-spaced grid of point defining the abscissa
+  ##        x = density values
+  ##        y = grid of output points
+  z_step <- z[2] - z[1]
+  cdf <- cumsum(x) * z_step
+  res <- approx(z, cdf, xout = y)
+  return(res$y)
+}
+```
+
+```{r}
+# load data
+X <- as.matrix(read.csv('../../data/processed/dat_X.csv'))
+X <- X[21:153,]
+Y <- as.matrix(read.csv('../../data/processed/dat_Y.csv'))
+loc_CV <- unlist(read.csv('../../data/processed/dat_CV.csv'))
+loc_CV <- loc_CV + 1
+```
+
+```{r}
+# Optional: apply Linear Regression to remove the conditional expectation ==> functional regression for residual
+Y_mean <- rowMeans(Y)
+model_linear <- lm(Y_mean~X)
+Y_res <- Y #- predict(model_linear, data.frame(X))
+```
+
+```{r}
+# create count matrix
+## choose the start points
+eps <- 1e-3
+y_range <- max(Y_res) - min(Y_res)
+y_start <- min(Y_res) - eps
+y_end <- max(Y_res) + eps
+print(c(y_start, y_end))
+## choose the number of bins using Sturges rule
+n_bins <- as.integer(1 + log2(dim(Y)[1] * dim(Y)[2]))
+step_size <- (y_end - y_start) / n_bins
+## calculate the CLR of Y
+loc_breaks <- seq(y_start, y_end, length.out = n_bins + 1)
+Y_count <- apply(Y_res, 1, function(x) return(hist(x, breaks = loc_breaks, plot = FALSE)$counts))
+```
+
+```{r}
+# apply CLR transformation to count matrix
+## process the zero counts
+s <- 1 ## Perks prior
+mat_alpha <- rowSums(Y_count) - Y_count
+mat_t <- mat_alpha / colSums(mat_alpha)
+mat_x <- Y_count / colSums(Y_count)
+mat_r <- matrix(0, nrow = nrow(Y_count), ncol = ncol(Y_count))
+Y_comp <- matrix(0, nrow = nrow(Y_count), ncol = ncol(Y_count))
+for (i in 1:ncol(Y_count)){
+  for (j in 1:nrow(Y_count)){
+    if (mat_x[j, i] == 0){
+      mat_r[j, i] <- mat_t[j, i] * s / (s + n_bins)
+    }
+  }
+}
+for (i in 1:ncol(Y_count)){
+  for (j in 1:nrow(Y_count)){
+    if (mat_x[j, i] > 0){
+      Y_comp[j, i] <- mat_x[j, i] * (1 - sum(mat_r[, i]))
+    }
+    else{
+      Y_comp[j, i] <- mat_r[j, i]
+    }
+  }
+}
+Y_dens <- Y_comp / step_size
+Y_clr <- apply(Y_dens, 2, function(x) return(log(x) - mean(log(x))))
+```
+
+```{r, fig.width=7, fig.height=2}
+## calculate the B-spline coefficient of Y_clr
+y_start <- min(Y_res) - eps + step_size / 2
+y_end <- max(Y_res) + eps - step_size / 2
+z <- seq(y_start, y_end, length.out = n_bins)
+n_knot <- 10
+Y_coef <- apply(Y_clr, 2, function(x) return(clr2coef(z, x, n_knot, y_start, y_end)))
+## visualize the smoothed densities
+norder <- 3          # order of splines (degree + 1)
+nbasis <- n_knot + norder - 2 
+knots <- seq(y_start, y_end, length=n_knot) # knots 
+splajn.basis <- create.bspline.basis(c(y_start, y_end), nbasis, norder, breaks = knots)
+loc_fine = seq(y_start, y_end, length.out = 256)
+Y_dens_smooth <- apply(Y_coef, 2, function(x) return(coef2density(loc_fine, splajn.basis, x)))
+
+plots_ <- list()
+for (i in 1:10){
+  idd <- i * 5
+  df_dens <- data.frame(x=loc_fine, y=Y_dens_smooth[, idd])
+  df_hist <- data.frame(x=Y_res[idd, ])
+  plots_[[i]] <- ggplot(data = df_hist, aes(x=x, ..density..)) +
+  geom_histogram(bins = 30, fill="lightblue", color='blue') +
+  geom_line(data = df_dens, aes(x=x,y=y),  color='orange') + 
+  theme(legend.position = "none") + theme_bw()
+}
+#grid.arrange(plots_[[1]], plots_[[2]], plots_[[3]], plots_[[4]], nrow = 1)
+plot_grid(plots_[[1]], plots_[[2]], plots_[[3]], plots_[[4]], plots_[[5]],
+          plots_[[6]], plots_[[7]], plots_[[8]], plots_[[9]], plots_[[10]],
+          ncol = 5, rel_widths = c(1, 1, 1, 1, 1))
+
+
+```
+
+```{r, fig.width=7, fig.height=2}
+Y_new <- as.matrix(t(Y_coef))
+# design matrix X
+x1 = rep(1, dim(X)[1])
+X_new = as.matrix(cbind(x1,X))
+# Estimate matrix B with LSE 
+# dim(B) = 2 x (g+k+1) 
+B = solve(t(X_new)%*%X_new)%*%t(X_new)%*%Y_new
+pred_mat <- X_new %*% B
+Y_dens_pred <- apply(pred_mat, 1, function(x) return(coef2density(loc_fine, splajn.basis, x)))
+plots_ <- list()
+for (i in 1:10){
+  idd <- i * 5
+  df_dens <- data.frame(x=loc_fine, y=Y_dens_pred[, idd])
+  df_hist <- data.frame(x=Y_res[idd, ])
+  plots_[[i]] <- ggplot(data = df_hist, aes(x=x, ..density..)) +
+  geom_histogram(bins = 30, fill="lightblue", color='blue') +
+  geom_line(data = df_dens, aes(x=x,y=y),  color='orange') + 
+  theme(legend.position = "none") + theme_bw()
+}
+#grid.arrange(plots_[[1]], plots_[[2]], plots_[[3]], plots_[[4]], nrow = 1)
+plot_grid(plots_[[1]], plots_[[2]], plots_[[3]], plots_[[4]], plots_[[5]],
+          plots_[[6]], plots_[[7]], plots_[[8]], plots_[[9]], plots_[[10]],
+          ncol = 5, rel_widths = c(1, 1, 1, 1, 1))
+```
+
+```{r, fig.width=7, fig.height=2}
+# Cross validation
+## save the training results
+## split the data
+n_fold <- max(loc_CV)
+# start running the model
+time_start <- Sys.time()
+train_loss <- rep(0, n_fold)
+val_loss <- rep(0, n_fold)
+dens_pred <- matrix(0, nrow = dim(Y)[1], ncol = 256)
+dens_train <- array(0, dim=c(dim(Y)[1], 256, n_fold))
+for (id_fold in 1:n_fold){
+  print(paste0('This is fold ', id_fold, '.'))
+  X_train <- X[loc_CV != id_fold, ]
+  Y_train <- Y[loc_CV != id_fold, ]
+  X_val <- X[loc_CV == id_fold, ]
+  Y_val <- Y[loc_CV == id_fold, ]
+  ## training coefficient
+  train_coef <- Y_coef[, loc_CV != id_fold]
+  X_train_full = as.matrix(cbind(rep(1, dim(X_train)[1]), X_train))
+  X_val_full = as.matrix(cbind(rep(1, dim(X_val)[1]), X_val))
+  B = solve(t(X_train_full)%*%X_train_full)%*%t(X_train_full)%*%as.matrix(t(train_coef))
+  pred_mat <- X_val_full %*% B
+  dens_pred[loc_CV == id_fold, ] <- t(apply(pred_mat, 1, function(x) return(coef2density(loc_fine, splajn.basis, x))))
+  train_mat <- X_train_full %*% B
+  dens_train[loc_CV != id_fold, , id_fold] <- t(apply(train_mat, 1, function(x) return(coef2density(loc_fine, splajn.basis, x))))
+}
+print(Sys.time() - time_start)
+
+plots_ <- list()
+for (i in 1:10){
+  idd <- i * 5
+  df_dens_val <- data.frame(x=loc_fine, y=dens_pred[idd,])
+  df_dens_train <- data.frame(x=loc_fine, y=Y_dens_pred[,idd])
+  df_hist <- data.frame(x=Y_res[idd, ])
+  plots_[[i]] <- ggplot(data = df_hist, aes(x=x, ..density..)) +
+  geom_histogram(bins = 30, fill="lightblue", color='blue') +
+  geom_line(data = df_dens_train, aes(x=x,y=y),  color='red') + 
+  geom_line(data = df_dens_val, aes(x=x,y=y),  color='orange') + 
+  theme(legend.position = "none") + theme_bw()
+}
+#grid.arrange(plots_[[1]], plots_[[2]], plots_[[3]], plots_[[4]], nrow = 1)
+plot_grid(plots_[[1]], plots_[[2]], plots_[[3]], plots_[[4]], plots_[[5]],
+          plots_[[6]], plots_[[7]], plots_[[8]], plots_[[9]], plots_[[10]],
+          ncol = 5, rel_widths = c(1, 1, 1, 1, 1))
+```
+
+```{r}
+# performance evaluation
+n_levs <- 100
+q_sup <- c(1:(n_levs-1)) / n_levs
+quantile_train <- t(apply(Y_dens_pred, 2, function(x) return(density2quantile(loc_fine, x, q_levs = q_sup))))
+quantile_val <- t(apply(dens_pred, 1, function(x) return(density2quantile(loc_fine, x, q_levs = q_sup))))
+q_out <-t(apply(Y_res, 1, function(x) {quantile(x, q_sup)}))
+train_loss <- mean((quantile_train - q_out)^2)
+val_loss <- mean((quantile_val - q_out)^2)
+
+# calculate R-squared
+q_Y <- t(apply(Y, 1, function(x) {quantile(x, q_sup)}))
+mat_res <- t(apply(q_Y, 1, function(x) x - colMeans(q_Y)))
+var_Y <- mean(mat_res^2)
+r_square_train <- 1 - train_loss / var_Y
+r_square_val <- 1 - val_loss / var_Y
+print(paste0('Output variance: ', var_Y))
+print(paste0('Train loss: ', train_loss))
+print(paste0('Train R-squared: ',r_square_train))
+print(paste0('Test loss: ', val_loss))
+print(paste0('Test R-squared: ',r_square_val))
+#write.csv(quantile_val, file = '../output/quantiles/qt_test_CLR.csv')
+#write.csv(quantile_train, file = '../output/quantiles/qt_train_CLR.csv')
+
+# the training prediction on each fold
+quantile_train <- array(0, dim = c(dim(quantile_val)[1], dim(quantile_val)[2], n_fold))
+
+for (id_fold in 1:n_fold){
+  quantile_train[loc_CV != id_fold, , id_fold] <- t(apply(dens_train[loc_CV != id_fold, , id_fold], 1, function(x) return(density2quantile(loc_fine, x, q_levs = q_sup))))
+}
+# import numpy
+#np = import("numpy")
+#np$save("../output/quantiles/qt_train_CLR.npy",r_to_py(quantile_train))
+```
+
+```{r}
+# functional partial dependence plot
+## specify the quantile levels
+p_levs <- c(0.1, 0.3, 0.5, 0.7, 0.9)
+y_levs <- quantile(Y, p_levs)
+q_levs <- seq(0, 1, 0.05)
+mat_qt_X <- apply(X, 2, function(x) {quantile(x, q_levs)})
+qt_array <- matrix(0, nrow = 4*length(q_levs), ncol = length(p_levs))
+cdf_array <- matrix(0, nrow = 4*length(q_levs), ncol = length(p_levs))
+pdf_array <- matrix(0, nrow = 4*length(q_levs), ncol = length(p_levs))
+cdf_array <- matrix(0, nrow = 4*length(q_levs), ncol = length(p_levs))
+## quantiles of the data
+mat_qt_d <- apply(Y, 1, function(x) {quantile(x, p_levs)})
+## start calculation
+time_start <- Sys.time()
+print(time_start)
+for (i in 1:4){
+  for (j in 1:length(q_levs)){
+    X_c <- X
+    X_c[, i] <- mat_qt_X[j, i]
+    B = solve(t(X)%*%X)%*%t(X)%*%as.matrix(t(Y_coef))
+    pred_mat <- X_c %*% B
+    ## conditional quantiles
+    dens_pred <- t(apply(pred_mat, 1, function(x) return(coef2density(loc_fine, splajn.basis, x))))
+    quantile_mat <- t(apply(dens_pred, 1, function(x) return(density2quantile(loc_fine, x, q_levs = p_levs))))
+    id_row <- (i - 1) * length(q_levs) + j
+    qt_array[id_row, ] <- colMeans(quantile_mat)
+    ## conditional pdf
+    pdf_mat <- t(apply(pred_mat, 1, function(x) return(coef2density(y_levs, splajn.basis, x))))
+    pdf_array[id_row, ] <- colMeans(pdf_mat)
+    ## conditional cdf
+    cdf_mat <- t(apply(dens_pred, 1, function(x) return(density2cdf(loc_fine, x, y_levs))))
+    cdf_array[id_row, ] <- colMeans(cdf_mat)
+  }
+}
+print(Sys.time() - time_start)
+write.csv(qt_array, file = '../../output/predictions/res_CLR_qt.csv')
+#write.csv(pdf_array, file = '../output/res_CLR_pdf.csv')
+#write.csv(cdf_array, file = '../output/res_CLR_cdf.csv')
+```
+
+
+
